@@ -3,8 +3,8 @@
 | Piece | Service | Cost |
 |-------|---------|------|
 | Code | GitHub, private repository `bluepointlaundry/stack-house` | free |
-| Website | **Vercel** (Hobby plan), region Frankfurt (`fra1`) | free |
-| Database, photos, reminder timer | **Supabase**, project `stack-house` in the free **Stack House** organisation, region Frankfurt | free |
+| Website | **Vercel** (Hobby plan), region Singapore (`sin1`), next to the database | free |
+| Database, photos, reminder timer | **Supabase**, project in the free **Stack House** organisation, region Singapore (ap-southeast-1) | free |
 | Address | GoDaddy DNS: one CNAME record `stackhouse` pointing to Vercel | already paid |
 
 Your existing alsalemkuwait.com email (Microsoft 365) and GoDaddy page are not touched.
@@ -23,7 +23,7 @@ Your existing alsalemkuwait.com email (Microsoft 365) and GoDaddy page are not t
 1. GitHub: create the empty private repository. ✅ done
 2. Upload the code. ✅ done
 3. Supabase: create a free organisation called **Stack House**.
-4. Supabase: create the project `stack-house` in that organisation, region Central EU (Frankfurt). *(Claude does this through the Supabase connection.)*
+4. Supabase: create the project in that organisation. ✅ done (Singapore)
 5. Supabase: **Project Settings → Database → Reset database password** → copy the new password. Then click **Connect** (top of the project page) → **Transaction pooler** → copy the URI.
 6. Vercel: **Add New → Project → Import** `stack-house`. Under **Environment Variables** add:
    - `DATABASE_URL` = the URI from step 5
