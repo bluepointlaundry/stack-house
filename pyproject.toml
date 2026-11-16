@@ -1,0 +1,14 @@
+[project]
+name = "stack-house"
+version = "1.0.0"
+description = "Stack House central kitchen ordering app"
+requires-python = ">=3.12"
+dependencies = [
+    "Flask>=3.1,<4",
+    "pywebpush>=2.0,<3",
+    "tzdata>=2024.1",
+    "psycopg[binary]>=3.2,<4",
+]
+
+[tool.vercel]
+entrypoint = "index:app"

@@ -10,7 +10,7 @@ from . import clock, settings
 from .db import connect, transaction
 
 log = logging.getLogger("stackhouse.notify")
-_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="push")
+_background = ThreadPoolExecutor(max_workers=2, thread_name_prefix="push")
 
 
 # --- VAPID keys -----------------------------------------------------------------
@@ -26,8 +26,13 @@ def ensure_vapid_keys(conn):
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
     ).decode()
     pub = key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
-    settings.set_value(conn, "vapid_private_pem", pem)
-    settings.set_value(conn, "vapid_public_key", base64.urlsafe_b64encode(pub).rstrip(b"=").decode())
+    with transaction(conn):
+        # two servers starting at once must end up with the same key pair
+        conn.execute("INSERT INTO settings (key, value) VALUES ('vapid_private_pem', ?) ON CONFLICT (key) DO NOTHING",
+                     (pem,))
+        stored = settings.get_value(conn, "vapid_private_pem")
+        if stored == pem:
+            settings.set_value(conn, "vapid_public_key", base64.urlsafe_b64encode(pub).rstrip(b"=").decode())
 
 
 def vapid_public_key(conn):
@@ -72,17 +77,21 @@ def notify(conn, user_ids, title, body="", url="/", kind="info", urgent=False):
     if subs:
         payload = json.dumps({"title": title, "body": body, "url": url, "kind": kind, "urgent": urgent,
                               "tag": f"{kind}-{now}"})
-        sender = current_app.config.get("PUSH_SENDER")
-        if sender:  # tests swap in a fake sender
-            sender(subs, payload, urgent)
+        cfg = current_app.config
+        if cfg.get("PUSH_SENDER"):  # tests swap in a fake sender
+            cfg["PUSH_SENDER"](subs, payload, urgent)
+            return len(ids)
+        job = (subs, payload, urgent, settings.get_value(conn, "vapid_private_pem"),
+               cfg["VAPID_SUBJECT"], cfg["DATABASE"])
+        if cfg.get("PUSH_SYNC"):
+            # Serverless (Vercel): the request is frozen once it returns, so send now.
+            _send_all(*job)
         else:
-            _pool.submit(_send_all, subs, payload, urgent,
-                         settings.get_value(conn, "vapid_private_pem"),
-                         current_app.config["VAPID_SUBJECT"], current_app.config["DB_PATH"])
+            _background.submit(_send_all, *job)
     return len(ids)
 
 
-def _send_all(subs, payload, urgent, vapid_pem, subject, db_path):
+def _send_all(subs, payload, urgent, vapid_pem, subject, database):
     try:
         from py_vapid import Vapid
         from pywebpush import WebPushException, webpush
@@ -90,8 +99,8 @@ def _send_all(subs, payload, urgent, vapid_pem, subject, db_path):
         log.warning("pywebpush is not installed; skipping push delivery")
         return
     vapid = Vapid.from_pem(vapid_pem.encode())
-    dead = []
-    for s in subs:
+
+    def send(s):
         try:
             webpush(
                 {"endpoint": s["endpoint"], "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}},
@@ -100,18 +109,21 @@ def _send_all(subs, payload, urgent, vapid_pem, subject, db_path):
                 vapid_claims={"sub": subject},
                 ttl=900 if urgent else 12 * 3600,
                 headers={"Urgency": "high" if urgent else "normal"},
-                timeout=10,
+                timeout=8,
             )
         except WebPushException as e:
             status = getattr(e.response, "status_code", None)
             if status in (404, 410):
-                dead.append(s["endpoint"])
-            else:
-                log.warning("push failed (%s): %s", status, e)
-        except Exception as e:  # network errors etc. must not kill the worker
+                return s["endpoint"]  # this device unsubscribed
+            log.warning("push failed (%s): %s", status, e)
+        except Exception as e:  # network errors etc. must not break the request
             log.warning("push failed: %s", e)
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(subs))) as pool:
+        dead = [ep for ep in pool.map(send, subs) if ep]
     if dead:
-        conn = connect(db_path)
+        conn = connect(database)
         try:
             for endpoint in dead:
                 conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))

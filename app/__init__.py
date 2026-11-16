@@ -1,50 +1,77 @@
-"""Stack House kitchen ordering app."""
+"""Stack House kitchen ordering app.
+
+Runs two ways:
+- locally / on a normal server:  python run.py   (SQLite file in ./data, reminders from a background thread)
+- on Vercel:  index.py + DATABASE_URL pointing at Supabase Postgres (reminders from Supabase pg_cron)
+"""
 import logging
 import os
-import secrets
+import urllib.parse
 from datetime import timedelta
 
 from flask import Flask, abort, redirect, request, send_from_directory
 
-from . import db, notify, scheduler
+from . import db, notify, settings
 from .api import bp as api_bp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+PUBLIC = os.path.join(ROOT, "public")  # page, styles, scripts, icons (Vercel serves these from its CDN)
 
 
-def _secret_key(data_dir):
-    path = os.path.join(data_dir, "secret_key")
-    if not os.path.exists(path):
-        with open(path, "w") as f:
-            f.write(secrets.token_hex(32))
-    with open(path) as f:
-        return f.read().strip()
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    return default if value is None else value == "1"
+
+
+def resolve_database(test_config, env, on_vercel):
+    """The database to use: a Postgres URL (Supabase) or a local SQLite file path."""
+    database = (test_config.get("DATABASE") or env.get("DATABASE_URL")
+                or env.get("POSTGRES_URL") or "").strip().strip('"').strip("'")
+    password = env.get("DATABASE_PASSWORD", "").strip()
+    if password and "[YOUR-PASSWORD]" in database:
+        # Supabase shows the address with a placeholder; the password is pasted separately.
+        database = database.replace("[YOUR-PASSWORD]", urllib.parse.quote(password, safe=""))
+    if "[YOUR-PASSWORD]" in database:
+        raise RuntimeError("DATABASE_URL still contains [YOUR-PASSWORD]. Add DATABASE_PASSWORD in Vercel.")
+    if database:
+        return database
+    if on_vercel:
+        raise RuntimeError("DATABASE_URL is not set. Add the Supabase connection string in Vercel.")
+    data_dir = test_config.get("DATA_DIR") or env.get("STACKHOUSE_DATA") or os.path.join(ROOT, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "stackhouse.db")
 
 
 def create_app(test_config=None):
     test_config = test_config or {}
-    data_dir = test_config.get("DATA_DIR") or os.environ.get("STACKHOUSE_DATA") or os.path.join(ROOT, "data")
-    os.makedirs(os.path.join(data_dir, "uploads"), exist_ok=True)
+    on_vercel = os.environ.get("VERCEL") == "1"
+    database = resolve_database(test_config, os.environ, on_vercel)
 
-    app = Flask(__name__, static_folder=STATIC, static_url_path="/static")
+    db.init_db(database)
+    conn = db.connect(database)
+    try:
+        notify.ensure_vapid_keys(conn)
+        secret_key = settings.get_value(conn, "secret_key")
+    finally:
+        conn.close()
+
+    app = Flask(__name__, static_folder=os.path.join(PUBLIC, "static"), static_url_path="/static")
     app.config.update(
-        DATA_DIR=data_dir,
-        DB_PATH=os.path.join(data_dir, "stackhouse.db"),
-        UPLOAD_DIR=os.path.join(data_dir, "uploads"),
-        SECRET_KEY=_secret_key(data_dir),
+        DATABASE=database,
+        SECRET_KEY=secret_key,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=os.environ.get("STACKHOUSE_SECURE_COOKIES") == "1",
+        SESSION_COOKIE_SECURE=_env_flag("STACKHOUSE_SECURE_COOKIES", on_vercel),
         SESSION_COOKIE_NAME="stackhouse",
         PERMANENT_SESSION_LIFETIME=timedelta(days=90),
-        MAX_CONTENT_LENGTH=6 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=4 * 1024 * 1024,
         SEND_FILE_MAX_AGE_DEFAULT=0,
-        VAPID_SUBJECT=os.environ.get("STACKHOUSE_VAPID_SUBJECT", "mailto:admin@example.com"),
-        SCHEDULER=True,
+        VAPID_SUBJECT=os.environ.get("STACKHOUSE_VAPID_SUBJECT", "https://stackhouse.alsalemkuwait.com"),
+        SCHEDULER=not on_vercel,  # on Vercel, Supabase pg_cron calls /api/cron/tick instead
+        PUSH_SYNC=on_vercel,      # serverless: send push notifications before the request ends
         PUSH_SENDER=None,
-        TRUST_PROXY=os.environ.get("STACKHOUSE_TRUST_PROXY") == "1",
-        FORCE_HTTPS=os.environ.get("STACKHOUSE_FORCE_HTTPS") == "1",
+        TRUST_PROXY=_env_flag("STACKHOUSE_TRUST_PROXY", on_vercel),
+        FORCE_HTTPS=_env_flag("STACKHOUSE_FORCE_HTTPS", on_vercel),
     )
     app.config.update(test_config)
 
@@ -52,21 +79,14 @@ def create_app(test_config=None):
         from werkzeug.middleware.proxy_fix import ProxyFix
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
+    app.teardown_appcontext(db.close_db)
+    app.register_blueprint(api_bp)
+
     @app.before_request
     def force_https():
         # Behind the hosting proxy, send anyone who typed http:// to the https:// address.
         if app.config["FORCE_HTTPS"] and request.scheme == "http" and request.path != "/healthz":
             return redirect(request.url.replace("http://", "https://", 1), code=301)
-
-    db.init_db(app.config["DB_PATH"])
-    conn = db.connect(app.config["DB_PATH"])
-    try:
-        notify.ensure_vapid_keys(conn)
-    finally:
-        conn.close()
-
-    app.teardown_appcontext(db.close_db)
-    app.register_blueprint(api_bp)
 
     @app.after_request
     def security_headers(resp):
@@ -84,34 +104,33 @@ def create_app(test_config=None):
 
     @app.get("/healthz")
     def healthz():
-        conn = db.connect(app.config["DB_PATH"])
-        try:
-            conn.execute("SELECT 1").fetchone()
-        finally:
-            conn.close()
+        db.get_db().execute("SELECT 1").fetchone()
         return {"ok": True}
 
+    # Locally Flask serves the files in public/; on Vercel the CDN serves them before Flask is reached.
     @app.get("/")
     def index():
-        return send_from_directory(STATIC, "index.html", max_age=0)
+        return send_from_directory(PUBLIC, "index.html", max_age=0)
 
     @app.get("/sw.js")
     def service_worker():
-        resp = send_from_directory(STATIC, "sw.js", max_age=0)
-        resp.headers["Service-Worker-Allowed"] = "/"
-        return resp
+        return send_from_directory(PUBLIC, "sw.js", max_age=0)
 
     @app.get("/manifest.webmanifest")
     def manifest():
-        return send_from_directory(STATIC, "manifest.webmanifest", mimetype="application/manifest+json")
+        return send_from_directory(PUBLIC, "manifest.webmanifest", mimetype="application/manifest+json")
 
     @app.get("/uploads/<name>")
     def uploads(name):
-        if "/" in name or "\\" in name or name.startswith("."):
+        row = db.get_db().execute("SELECT mime, data FROM images WHERE name = ?", (name,)).fetchone()
+        if not row:
             abort(404)
-        return send_from_directory(app.config["UPLOAD_DIR"], name, max_age=365 * 24 * 3600)
+        resp = app.response_class(bytes(row["data"]), mimetype=row["mime"])
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"  # names are never reused
+        return resp
 
     if app.config["SCHEDULER"]:
+        from . import scheduler
         scheduler.start(app)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

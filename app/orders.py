@@ -204,9 +204,9 @@ def save_plan(conn, cfg, user, house_id, d: date, meals_payload):
             else:
                 order_id = conn.execute(
                     "INSERT INTO orders (house_id, kind, service_date, meal, status, notes, created_by, updated_by, "
-                    "created_at, updated_at) VALUES (?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "created_at, updated_at) VALUES (?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                     (house_id, d.isoformat(), meal, status, notes, user["id"], user["id"], now, now),
-                ).lastrowid
+                ).fetchone()["id"]
             _write_items(conn, order_id, items)
         bump_version(conn)
 
@@ -234,9 +234,9 @@ def create_urgent(conn, cfg, user, house_id, raw_items, notes, needed_by):
     with transaction(conn):
         order_id = conn.execute(
             "INSERT INTO orders (house_id, kind, service_date, meal, status, notes, needed_by, created_by, "
-            "updated_by, created_at, updated_at) VALUES (?, 'urgent', ?, NULL, 'pending', ?, ?, ?, ?, ?, ?)",
+            "updated_by, created_at, updated_at) VALUES (?, 'urgent', ?, NULL, 'pending', ?, ?, ?, ?, ?, ?) RETURNING id",
             (house_id, rules.today(cfg).isoformat(), notes, needed_by, user["id"], user["id"], now, now),
-        ).lastrowid
+        ).fetchone()["id"]
         _write_items(conn, order_id, items)
         bump_version(conn)
     return load_orders(conn, "o.id = ?", (order_id,))[0]

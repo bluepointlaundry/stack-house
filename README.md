@@ -50,7 +50,7 @@ To let phones on the same Wi-Fi use it, start it with `--host 0.0.0.0` and open 
 .venv\Scripts\python run.py --host 0.0.0.0
 ```
 
-All data (database, dish photos, keys) lives in the `data` folder. Back it up by copying that folder while the app is stopped.
+When run locally, all data (database, dish photos, keys) lives in `data/stackhouse.db`. Admins can download a backup any time from **Admin → Settings → Download backup**.
 
 ## Phone notifications
 
@@ -61,20 +61,21 @@ Reminders and alerts always appear in the app (bell icon). To also get them as *
 
 For https you can either host it online, or keep it on a home computer and expose it with a tunnel such as Cloudflare Tunnel or Tailscale Funnel. Whatever you choose, the server must stay on all day for the reminders to go out on time.
 
-**The live setup for Stack House (Railway + GitHub + stackhouse.alsalemkuwait.com) is described step by step in [DEPLOY.md](DEPLOY.md).** The `Dockerfile` and `railway.json` in this folder are what Railway uses.
+**The live setup for Stack House (Vercel + Supabase + stackhouse.alsalemkuwait.com) is described in [DEPLOY.md](DEPLOY.md).** `index.py`, `pyproject.toml` and `vercel.json` are what Vercel uses; set `DATABASE_URL` (+ `DATABASE_PASSWORD`) to the Supabase Postgres connection to use Postgres instead of the local SQLite file.
 
 ### Settings for hosting
 
 | Environment variable | Meaning |
 | --- | --- |
 | `PORT` / `STACKHOUSE_HOST` | Port and address to listen on (default `8000`, `127.0.0.1`) |
-| `STACKHOUSE_DATA` | Folder for the database and photos (default `./data`; or `run.py --data`) |
+| `DATABASE_URL` | PostgreSQL connection (e.g. Supabase). If it contains `[YOUR-PASSWORD]`, set `DATABASE_PASSWORD` too |
+| `STACKHOUSE_DATA` | Folder for the local SQLite database when `DATABASE_URL` is not set (default `./data`; or `run.py --data`) |
 | `STACKHOUSE_SECURE_COOKIES=1` | Set when the site is served over https |
 | `STACKHOUSE_TRUST_PROXY=1` | Set when running behind a reverse proxy or tunnel |
 | `STACKHOUSE_FORCE_HTTPS=1` | Redirect http:// to https:// and send HSTS (behind an https proxy) |
 | `STACKHOUSE_VAPID_SUBJECT` | Contact for push services, e.g. `mailto:you@yourdomain.com` |
 
-Run a single server process (the built-in `run.py` does this); reminders are sent by a background thread inside it.
+With `run.py`, reminders are sent by a background thread inside the server. On Vercel there is no always-running process, so Supabase `pg_cron` calls `POST /api/cron/tick` every minute instead (see DEPLOY.md).
 
 ## Tests
 
@@ -82,10 +83,13 @@ Run a single server process (the built-in `run.py` does this); reminders are sen
 .venv\Scripts\python -m unittest discover -s tests -t .
 ```
 
+To run the same tests on PostgreSQL, `pip install pgserver` and set `STACKHOUSE_TEST_PG=1` first.
+
 ## Project layout
 
 ```
-run.py              start the server (Waitress)
+run.py              start the server locally (Waitress)
+index.py            Vercel entrypoint
 app/__init__.py     app setup, security headers, static files
 app/api.py          JSON API used by the web page
 app/orders.py       meal plans, Order now requests, kitchen prep lists
@@ -93,10 +97,10 @@ app/rules.py        working hours, service days and lock times
 app/scheduler.py    daily reminders, lock summary, morning brief
 app/notify.py       in-app notifications and Web Push
 app/settings.py     kitchen settings and validation
-app/db.py           SQLite schema and first-run data
-app/static/         the web app (HTML, CSS, JavaScript, icons, service worker)
+app/db.py           database layer (SQLite locally, PostgreSQL/Supabase live), schema, first-run data
+public/             the web app (HTML, CSS, JavaScript, icons, service worker)
 tests/              automated tests
 tools/smoke_test.py check a running site from the outside
-Dockerfile          production image (Railway)
-railway.json        Railway build/health-check settings
+vercel.json         Vercel region, function and header settings
+pyproject.toml      dependencies and entrypoint for Vercel
 ```

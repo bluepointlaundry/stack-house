@@ -4,7 +4,6 @@
 a second worker or a fast loop never sends the same reminder twice.
 """
 import logging
-import sqlite3
 import threading
 import time
 from datetime import timedelta
@@ -18,11 +17,10 @@ _started = False
 
 
 def _claim(conn, key):
-    try:
-        conn.execute("INSERT INTO job_runs (key, ran_at) VALUES (?, ?)", (key, clock.iso_now()))
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    """True for exactly one caller per key, even with several servers ticking at once."""
+    row = conn.execute("INSERT INTO job_runs (key, ran_at) VALUES (?, ?) ON CONFLICT (key) DO NOTHING RETURNING key",
+                       (key, clock.iso_now())).fetchone()
+    return row is not None
 
 
 def _due(now, at):
@@ -31,6 +29,7 @@ def _due(now, at):
 
 def run_due_jobs(conn):
     cfg = settings.load(conn)
+    settings.set_value(conn, "last_tick", clock.iso_now())
     now = rules.local_now(cfg)
     today = now.date()
     tomorrow = today + timedelta(days=1)
@@ -63,6 +62,7 @@ def run_due_jobs(conn):
         old = (clock.now_utc() - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn.execute("DELETE FROM notifications WHERE created_at < ?", (old,))
         conn.execute("DELETE FROM job_runs WHERE ran_at < ?", (old,))
+        conn.execute("DELETE FROM login_failures WHERE at < ?", (old,))
     return done
 
 
@@ -124,7 +124,7 @@ def start(app, interval=30):
         while True:
             try:
                 with app.app_context():
-                    conn = connect(app.config["DB_PATH"])
+                    conn = connect(app.config["DATABASE"])
                     try:
                         for job in run_due_jobs(conn):
                             log.info("ran job %s", job)

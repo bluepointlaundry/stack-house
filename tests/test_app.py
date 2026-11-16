@@ -14,6 +14,28 @@ from app.db import connect
 from app.scheduler import run_due_jobs
 
 TZ = ZoneInfo("Asia/Bahrain")
+PG_URL = os.environ.get("STACKHOUSE_TEST_DATABASE_URL")
+_pg_server = None
+
+
+def setUpModule():
+    global PG_URL, _pg_server
+    if os.environ.get("STACKHOUSE_TEST_PG") == "1" and not PG_URL:
+        import pgserver
+        _pg_server = pgserver.get_server(tempfile.mkdtemp(prefix="stackhouse-pg-"), cleanup_mode="stop")
+        PG_URL = _pg_server.get_uri()
+
+
+def fresh_db(tmpdir):
+    """Config for an empty database: a wiped Postgres schema, or a new SQLite file."""
+    if PG_URL:
+        conn = connect(PG_URL)
+        try:
+            conn.script("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        finally:
+            conn.close()
+        return {"DATABASE": PG_URL}
+    return {"DATA_DIR": tmpdir}
 
 
 def at(day, hm):
@@ -27,7 +49,7 @@ class StackHouseTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.pushes = []
         self.app = create_app({
-            "DATA_DIR": self.dir, "SCHEDULER": False, "TESTING": True,
+            **fresh_db(self.dir), "SCHEDULER": False, "TESTING": True,
             "PUSH_SENDER": lambda subs, payload, urgent: self.pushes.append((subs, payload, urgent)),
         })
         self.admin = self.app.test_client()
@@ -69,7 +91,7 @@ class StackHouseTest(unittest.TestCase):
         return client.put(f"/api/plan/{day}", json={"meals": meals, **extra})
 
     def db(self):
-        return connect(self.app.config["DB_PATH"])
+        return connect(self.app.config["DATABASE"])
 
     # tests ---------------------------------------------------------------------
     def test_setup_only_once_and_login(self):
@@ -227,21 +249,45 @@ class StackHouseTest(unittest.TestCase):
 
     def test_backup_download(self):
         import io
-        import sqlite3
+        import json
         import zipfile
+        tiny_png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+        r = self.admin.post("/api/dishes", json={"name": "Photo dish", "categoryId": 1, "image": tiny_png})
+        self.assertEqual(r.status_code, 200, r.json)
+        img = self.admin.get(r.json["image"])
+        self.assertEqual((img.status_code, img.mimetype), (200, "image/png"))
+
         self.assertEqual(self.salem.get("/api/admin/backup").status_code, 403)
         r = self.admin.get("/api/admin/backup")
         self.assertEqual(r.status_code, 200)
         self.assertIn("attachment", r.headers["Content-Disposition"])
         with zipfile.ZipFile(io.BytesIO(r.data)) as z:
-            path = os.path.join(self.dir, "restored.db")
-            with open(path, "wb") as f:
-                f.write(z.read("stackhouse.db"))
-        conn = sqlite3.connect(path)
+            data = json.loads(z.read("stackhouse-data.json"))
+            photos = [n for n in z.namelist() if n.startswith("uploads/")]
+        self.assertEqual(len(data["tables"]["users"]), 4)
+        self.assertEqual(len(data["tables"]["houses"]), 4)
+        self.assertEqual(len(photos), 1)
+
+    def test_cron_tick_needs_the_secret(self):
+        self.assertEqual(self.app.test_client().post("/api/cron/tick", json={}).status_code, 401)
+        bad = self.app.test_client().post("/api/cron/tick", json={}, headers={"Authorization": "Bearer nope"})
+        self.assertEqual(bad.status_code, 401)
+        conn = self.db()
         try:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], 4)
+            secret = conn.execute("SELECT value FROM settings WHERE key = 'cron_secret'").fetchone()[0]
         finally:
             conn.close()
+        clock.set_fake_now(at(16, "18:00"))
+        r = self.app.test_client().post("/api/cron/tick", json={}, headers={"Authorization": f"Bearer {secret}"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("reminder:2026-11-16:18:00", r.json["ran"])
+        self.assertTrue(self.admin.get("/api/bootstrap").json["lastTick"])
+
+    def test_login_throttle(self):
+        c = self.app.test_client()
+        for _ in range(8):
+            self.assertEqual(c.post("/api/login", json={"username": "salem", "password": "wrong"}).status_code, 401)
+        self.assertEqual(c.post("/api/login", json={"username": "salem", "password": "secret1"}).status_code, 429)
 
     def test_password_change_signs_out_other_sessions(self):
         other = self.login("salem")
@@ -256,7 +302,7 @@ class LiveHostingTest(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.app = create_app({"DATA_DIR": self.dir, "SCHEDULER": False, "TESTING": True,
+        self.app = create_app({**fresh_db(self.dir), "SCHEDULER": False, "TESTING": True,
                                "TRUST_PROXY": True, "FORCE_HTTPS": True, "SESSION_COOKIE_SECURE": True})
         self.c = self.app.test_client()
 
@@ -279,6 +325,19 @@ class LiveHostingTest(unittest.TestCase):
         cookie = r.headers["Set-Cookie"]
         self.assertIn("Secure", cookie)
         self.assertIn("HttpOnly", cookie)
+
+    def test_database_address_and_password_are_joined(self):
+        from app import resolve_database
+        url = "postgresql://postgres.abc:[YOUR-PASSWORD]@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
+        got = resolve_database({}, {"DATABASE_URL": f" {url} ", "DATABASE_PASSWORD": "p@ss word"}, True)
+        self.assertEqual(got, url.replace("[YOUR-PASSWORD]", "p%40ss%20word"))
+        with self.assertRaises(RuntimeError):
+            resolve_database({}, {"DATABASE_URL": url}, True)  # password missing
+        with self.assertRaises(RuntimeError):
+            resolve_database({}, {}, True)  # nothing configured on Vercel
+        from app.db import clean_postgres_url
+        cleaned = clean_postgres_url("postgres://u:p@db.example.com:6543/postgres?supa=base-pooler.x&sslmode=require")
+        self.assertEqual(cleaned, "postgres://u:p@db.example.com:6543/postgres?sslmode=require")
 
     def test_health_check_works_over_plain_http(self):
         r = self.c.get("/healthz")  # the host's health check calls without the proxy headers

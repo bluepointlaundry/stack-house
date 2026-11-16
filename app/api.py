@@ -1,7 +1,7 @@
 """JSON API used by the web app."""
 import base64
 import binascii
-import os
+import json
 import uuid
 from datetime import date, timedelta
 
@@ -9,7 +9,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from . import clock, notify, orders, rules, settings
 from .auth import (ApiError, check_new_password, check_throttle, clean_username, clear_failures, current_user,
-                   hash_password, is_kitchen, login_user, logout_user, record_failure, require_login,
+                   hash_password, login_user, logout_user, record_failure, require_login,
                    verify_password)
 from .db import add_sample_dishes, get_db, transaction
 
@@ -111,6 +111,8 @@ def bootstrap():
             "vapidPublicKey": notify.vapid_public_key(conn),
             "version": orders.get_version(conn),
         })
+        if user["is_admin"]:
+            data["lastTick"] = settings.get_value(conn, "last_tick")
     return jsonify(data)
 
 
@@ -131,10 +133,10 @@ def setup():
             raise ApiError(409, "Setup has already been completed.")
         uid = conn.execute(
             "INSERT INTO users (username, name, password_hash, role, is_admin, house_id, kitchen_alerts, created_at, "
-            "last_login_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            "last_login_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?) RETURNING id",
             (username, name, hash_password(data["password"]), role, house_id, 1 if role == "chef" else 0,
              clock.iso_now(), clock.iso_now()),
-        ).lastrowid
+        ).fetchone()["id"]
         if tz and settings.valid_timezone(tz):
             cfg = settings.load(conn)
             cfg["timezone"] = tz
@@ -203,7 +205,7 @@ def menu():
     conn = get_db()
     show_all = request.args.get("all") == "1" and current_user()["is_admin"]
     where = "" if show_all else "WHERE active = 1"
-    dishes = [dish_json(r) for r in conn.execute(f"SELECT * FROM dishes {where} ORDER BY name COLLATE NOCASE")]
+    dishes = [dish_json(r) for r in conn.execute(f"SELECT * FROM dishes {where} ORDER BY lower(name)")]
     return jsonify(categories=categories(conn), dishes=dishes)
 
 
@@ -216,25 +218,23 @@ def _save_image(data_url):
     if len(raw) > 3 * 1024 * 1024:
         raise ApiError(400, "Photo is too large (max 3 MB).")
     if raw[:3] == b"\xff\xd8\xff":
-        ext = "jpg"
+        ext, mime = "jpg", "image/jpeg"
     elif raw[:8] == b"\x89PNG\r\n\x1a\n":
-        ext = "png"
+        ext, mime = "png", "image/png"
     elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        ext = "webp"
+        ext, mime = "webp", "image/webp"
     else:
         raise ApiError(400, "Photo must be a JPEG, PNG or WebP image.")
     name = f"{uuid.uuid4().hex}.{ext}"
-    with open(os.path.join(current_app.config["UPLOAD_DIR"], name), "wb") as f:
-        f.write(raw)
+    # Photos live in the database: serverless hosts have no lasting disk.
+    get_db().execute("INSERT INTO images (name, mime, data, created_at) VALUES (?, ?, ?, ?)",
+                     (name, mime, raw, clock.iso_now()))
     return f"/uploads/{name}"
 
 
 def _delete_image(path):
     if path and path.startswith("/uploads/"):
-        try:
-            os.remove(os.path.join(current_app.config["UPLOAD_DIR"], os.path.basename(path)))
-        except OSError:
-            pass
+        get_db().execute("DELETE FROM images WHERE name = ?", (path.rsplit("/", 1)[-1],))
 
 
 def _dish_fields(conn, data, existing=None):
@@ -257,7 +257,7 @@ def create_dish():
     now = clock.iso_now()
     did = conn.execute(
         "INSERT INTO dishes (category_id, name, description, image, active, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)", (cat_id, name, desc, image, int(active), now, now)).lastrowid
+        "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", (cat_id, name, desc, image, int(active), now, now)).fetchone()["id"]
     return jsonify(dish_json(conn.execute("SELECT * FROM dishes WHERE id = ?", (did,)).fetchone()))
 
 
@@ -303,7 +303,7 @@ def create_category():
     data = body()
     name = text(data.get("name"), 40, "Category name", required=True)
     icon = text(data.get("icon"), 8, "Icon") or "🍽️"
-    if conn.execute("SELECT 1 FROM categories WHERE name = ?", (name,)).fetchone():
+    if conn.execute("SELECT 1 FROM categories WHERE lower(name) = lower(?)", (name,)).fetchone():
         raise ApiError(409, "That category already exists.")
     order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories").fetchone()[0]
     conn.execute("INSERT INTO categories (name, icon, sort_order) VALUES (?, ?, ?)", (name, icon, order))
@@ -320,7 +320,7 @@ def update_category(cat_id):
     data = body()
     name = text(data.get("name", row["name"]), 40, "Category name", required=True)
     icon = text(data.get("icon", row["icon"]), 8, "Icon") or "🍽️"
-    clash = conn.execute("SELECT 1 FROM categories WHERE name = ? AND id != ?", (name, cat_id)).fetchone()
+    clash = conn.execute("SELECT 1 FROM categories WHERE lower(name) = lower(?) AND id != ?", (name, cat_id)).fetchone()
     if clash:
         raise ApiError(409, "That category already exists.")
     with transaction(conn):
@@ -546,7 +546,10 @@ def read_notifications():
         conn.execute("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL",
                      (clock.iso_now(), uid))
     else:
-        for nid in data.get("ids", [])[:200]:
+        ids = data.get("ids") if isinstance(data.get("ids"), list) else []
+        for nid in ids[:200]:
+            if not isinstance(nid, int):
+                continue
             conn.execute("UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL",
                          (clock.iso_now(), nid, uid))
     return jsonify(ok=True)
@@ -592,7 +595,7 @@ def push_test():
 @bp.get("/admin/users")
 @require_login(admin=True)
 def admin_users():
-    rows = get_db().execute("SELECT * FROM users ORDER BY active DESC, name COLLATE NOCASE")
+    rows = get_db().execute("SELECT * FROM users ORDER BY active DESC, lower(name)")
     return jsonify(users=[user_json(r) for r in rows])
 
 
@@ -630,9 +633,9 @@ def admin_create_user():
         raise ApiError(409, "That username is taken.")
     uid = conn.execute(
         "INSERT INTO users (username, name, password_hash, role, is_admin, house_id, kitchen_alerts, active, "
-        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         (username, name, hash_password(data["password"]), role, int(is_admin), house_id, int(alerts),
-         int(active), clock.iso_now())).lastrowid
+         int(active), clock.iso_now())).fetchone()["id"]
     return jsonify(user_json(conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()))
 
 
@@ -713,7 +716,7 @@ def admin_houses():
 def admin_create_house():
     conn = get_db()
     name, color, people = _house_fields(body())
-    if conn.execute("SELECT 1 FROM houses WHERE name = ?", (name,)).fetchone():
+    if conn.execute("SELECT 1 FROM houses WHERE lower(name) = lower(?)", (name,)).fetchone():
         raise ApiError(409, "A family with that name already exists.")
     order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM houses").fetchone()[0]
     conn.execute("INSERT INTO houses (name, color, people, sort_order, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -729,7 +732,7 @@ def admin_update_house(house_id):
     if not existing:
         raise ApiError(404, "Family not found.")
     name, color, people = _house_fields(body(), existing)
-    if conn.execute("SELECT 1 FROM houses WHERE name = ? AND id != ?", (name, house_id)).fetchone():
+    if conn.execute("SELECT 1 FROM houses WHERE lower(name) = lower(?) AND id != ?", (name, house_id)).fetchone():
         raise ApiError(409, "A family with that name already exists.")
     conn.execute("UPDATE houses SET name = ?, color = ?, people = ? WHERE id = ?", (name, color, people, house_id))
     return admin_houses()
@@ -764,35 +767,45 @@ def admin_settings():
 @bp.get("/admin/backup")
 @require_login(admin=True)
 def admin_backup():
-    """A zip with a consistent copy of the database plus all dish photos."""
+    """A zip with every table as JSON (stackhouse-data.json) plus all dish photos (uploads/)."""
     import io
-    import sqlite3
-    import tempfile
     import zipfile
 
-    from .db import connect
-
+    conn = get_db()
+    tables = ["houses", "users", "categories", "dishes", "orders", "order_items", "settings",
+              "push_subscriptions", "notifications"]
     buf = io.BytesIO()
-    with tempfile.TemporaryDirectory() as tmp:
-        snap_path = os.path.join(tmp, "stackhouse.db")
-        src = connect(current_app.config["DB_PATH"])
-        dst = sqlite3.connect(snap_path)
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-            src.close()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(snap_path, "stackhouse.db")
-            up = current_app.config["UPLOAD_DIR"]
-            for name in sorted(os.listdir(up)):
-                if os.path.isfile(os.path.join(up, name)):
-                    z.write(os.path.join(up, name), f"uploads/{name}")
+    with transaction(conn), zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if conn.postgres:  # one consistent snapshot of all tables
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        data = {"format": "stackhouse-backup-1", "exportedAt": clock.iso_now(),
+                "tables": {t: [dict(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY 1")] for t in tables}}
+        z.writestr("stackhouse-data.json", json.dumps(data, ensure_ascii=False, indent=1))
+        for img in conn.execute("SELECT name, data FROM images ORDER BY name"):
+            z.writestr(f"uploads/{img['name']}", bytes(img["data"]))
     stamp = clock.now_utc().strftime("%Y%m%d-%H%M")
     resp = current_app.response_class(buf.getvalue(), mimetype="application/zip")
     resp.headers["Content-Disposition"] = f'attachment; filename="stackhouse-backup-{stamp}.zip"'
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@bp.post("/cron/tick")
+def cron_tick():
+    """Called every minute by Supabase (pg_cron) when running serverless: sends due reminders.
+
+    Protected by a random secret that only the database knows (settings.cron_secret).
+    """
+    import hmac
+
+    from . import scheduler
+
+    conn = get_db()
+    expected = settings.get_value(conn, "cron_secret") or ""
+    given = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not expected or not hmac.compare_digest(given.encode(), expected.encode()):
+        raise ApiError(401, "Not allowed.")
+    return jsonify(ran=scheduler.run_due_jobs(conn))
 
 
 @bp.get("/admin/timezones")

@@ -1,12 +1,12 @@
 """Login sessions, password hashing and permission checks."""
 import re
-import threading
-import time
+from datetime import timedelta
 from functools import wraps
 
 from flask import g, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from . import clock
 from .db import get_db
 
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
@@ -91,32 +91,30 @@ def require_login(admin=False, kitchen=False):
     return deco
 
 
-# --- simple in-memory login throttling ---------------------------------------
-_attempts = {}
-_attempts_lock = threading.Lock()
-WINDOW_SECONDS = 300
+# --- login throttling (kept in the database so it works across serverless instances) ---
+WINDOW_MINUTES = 5
 MAX_FAILURES = 8
 
 
 def _key():
-    # remote_addr is the real client when STACKHOUSE_TRUST_PROXY enables ProxyFix behind a proxy.
-    return request.remote_addr or "?"
+    # remote_addr is the real client when ProxyFix is enabled behind the hosting proxy.
+    return (request.remote_addr or "?")[:64]
+
+
+def _since():
+    return (clock.now_utc() - timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def check_throttle():
-    now = time.time()
-    with _attempts_lock:
-        recent = [t for t in _attempts.get(_key(), []) if now - t < WINDOW_SECONDS]
-        _attempts[_key()] = recent
-        if len(recent) >= MAX_FAILURES:
-            raise ApiError(429, "Too many failed attempts. Try again in a few minutes.")
+    n = get_db().execute("SELECT COUNT(*) FROM login_failures WHERE ip = ? AND at > ?",
+                         (_key(), _since())).fetchone()[0]
+    if n >= MAX_FAILURES:
+        raise ApiError(429, "Too many failed attempts. Try again in a few minutes.")
 
 
 def record_failure():
-    with _attempts_lock:
-        _attempts.setdefault(_key(), []).append(time.time())
+    get_db().execute("INSERT INTO login_failures (ip, at) VALUES (?, ?)", (_key(), clock.iso_now()))
 
 
 def clear_failures():
-    with _attempts_lock:
-        _attempts.pop(_key(), None)
+    get_db().execute("DELETE FROM login_failures WHERE ip = ?", (_key(),))

@@ -1522,6 +1522,12 @@ ADMIN.settings = async (seq, head) => {
 
       <div class="card stack"><h2>${icon('bell')} Daily reminders</h2>
         <p class="small muted">Every day at these times, families that haven't chosen tomorrow's food get a reminder. The chef gets a summary when orders lock, and a morning brief when the kitchen opens.</p>
+        ${(() => {
+          const t = S.boot.lastTick ? (Date.now() - new Date(S.boot.lastTick).getTime()) / 60000 : null;
+          return t !== null && t < 5
+            ? `<span class="pill ok">${icon('check')} Reminder timer is running · last check ${esc(ago(S.boot.lastTick))}</span>`
+            : `<span class="pill danger">${icon('alert')} Reminder timer ${t === null ? 'has not run yet' : `last ran ${esc(ago(S.boot.lastTick))}`} — reminders won't go out</span>`;
+        })()}
         <div class="tag-list">${C.reminderTimes.map((t, i) => `<span class="pill accent">${esc(t)}<button data-act="rm-rem" data-i="${i}" aria-label="Remove ${esc(t)}">${icon('x')}</button></span>`).join('') || '<span class="small muted">No reminders.</span>'}</div>
         <div class="row"><input class="input time" type="time" id="new-rem" aria-label="New reminder time"><button class="btn sm secondary" data-act="add-rem">${icon('plus')} Add time</button></div></div>
 
