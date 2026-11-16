@@ -4,6 +4,7 @@ The rest of the app writes plain SQL with `?` placeholders and gets rows that wo
 both like dicts (row["name"]) and like tuples (row[0]); this module hides the
 differences between the two databases.
 """
+import re
 import secrets
 import sqlite3
 import urllib.parse
@@ -312,6 +313,38 @@ def init_db(target):
             conn.script(SCHEMA.format(ID="INTEGER PRIMARY KEY", BLOB="BLOB"))
             with conn.transaction():
                 _seed(conn)
+    finally:
+        conn.close()
+
+
+_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\d{1,5})?$")
+
+
+def ensure_supabase_timer(target, host):
+    """Make Supabase call https://<host>/api/cron/tick every minute (pg_cron + pg_net).
+
+    Returns (ok, message). Never raises: if the database can't do it, the admin page says so.
+    """
+    host = (host or "").strip().lower()
+    if not _HOST_RE.match(host):
+        return False, f"Invalid site address: {host!r}"
+    command = (
+        "select net.http_post("
+        f"url := 'https://{host}/api/cron/tick', "
+        "headers := jsonb_build_object('Content-Type', 'application/json', 'Authorization', "
+        "'Bearer ' || (select value from public.settings where key = 'cron_secret')), "
+        "body := '{}'::jsonb, timeout_milliseconds := 25000)"
+    )
+    conn = connect(target)
+    try:
+        conn.execute("CREATE EXTENSION IF NOT EXISTS pg_net")
+        conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cron")
+        current = conn.execute("SELECT command FROM cron.job WHERE jobname = 'stackhouse-tick'").fetchone()
+        if not current or current["command"] != command:
+            conn.execute("SELECT cron.schedule(?, ?, ?)", ("stackhouse-tick", "* * * * *", command))
+        return True, f"Supabase calls https://{host}/api/cron/tick every minute"
+    except Exception as e:  # e.g. extensions not available on this database
+        return False, f"Could not start the reminder timer: {e}".strip()[:300]
     finally:
         conn.close()
 

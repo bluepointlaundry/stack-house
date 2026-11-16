@@ -63,6 +63,11 @@ def run_due_jobs(conn):
         conn.execute("DELETE FROM notifications WHERE created_at < ?", (old,))
         conn.execute("DELETE FROM job_runs WHERE ran_at < ?", (old,))
         conn.execute("DELETE FROM login_failures WHERE at < ?", (old,))
+        if conn.postgres:  # Supabase keeps a row per timer run forever unless we tidy up
+            try:
+                conn.execute("DELETE FROM cron.job_run_details WHERE end_time < now() - interval '3 days'")
+            except Exception:
+                pass
     return done
 
 

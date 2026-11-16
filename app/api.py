@@ -113,6 +113,7 @@ def bootstrap():
         })
         if user["is_admin"]:
             data["lastTick"] = settings.get_value(conn, "last_tick")
+            data["timerSetup"] = settings.get_value(conn, "timer_setup")
     return jsonify(data)
 
 

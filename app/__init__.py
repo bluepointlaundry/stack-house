@@ -52,6 +52,13 @@ def create_app(test_config=None):
     try:
         notify.ensure_vapid_keys(conn)
         secret_key = settings.get_value(conn, "secret_key")
+        # Live on Vercel + Supabase: have the database call us every minute for reminders.
+        host = os.environ.get("STACKHOUSE_PUBLIC_HOST") or (
+            os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") if os.environ.get("VERCEL_ENV") == "production" else None)
+        if db.is_postgres(database) and host:
+            ok, message = db.ensure_supabase_timer(database, host)
+            settings.set_value(conn, "timer_setup", message)
+            logging.getLogger("stackhouse").log(logging.INFO if ok else logging.WARNING, message)
     finally:
         conn.close()
 

@@ -339,6 +339,16 @@ class LiveHostingTest(unittest.TestCase):
         cleaned = clean_postgres_url("postgres://u:p@db.example.com:6543/postgres?supa=base-pooler.x&sslmode=require")
         self.assertEqual(cleaned, "postgres://u:p@db.example.com:6543/postgres?sslmode=require")
 
+    def test_timer_setup_fails_gracefully(self):
+        from app.db import ensure_supabase_timer
+        ok, msg = ensure_supabase_timer(self.app.config["DATABASE"], "bad host'; drop table users; --")
+        self.assertFalse(ok)
+        self.assertIn("Invalid site address", msg)
+        # local SQLite / plain Postgres have no pg_cron: must report, not crash
+        ok, msg = ensure_supabase_timer(self.app.config["DATABASE"], "stack-house.vercel.app")
+        self.assertFalse(ok)
+        self.assertIn("Could not start the reminder timer", msg)
+
     def test_health_check_works_over_plain_http(self):
         r = self.c.get("/healthz")  # the host's health check calls without the proxy headers
         self.assertEqual(r.status_code, 200)
