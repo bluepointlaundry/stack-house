@@ -1489,7 +1489,9 @@ function userEditor(u, onSaved) {
 
 /* --- settings --- */
 ADMIN.settings = async (seq, head) => {
-  const tzs = (await api('/admin/timezones')).timezones;
+  const [{ timezones: tzs }, fresh] = await Promise.all([api('/admin/timezones'), api('/bootstrap')]);
+  S.boot.lastTick = fresh.lastTick;  // show the reminder timer's latest run, not the one from login
+  S.boot.timerSetup = fresh.timerSetup;
   const C = JSON.parse(JSON.stringify(S.boot.settings));
   let snapshot = JSON.stringify(C);
   const dirty = () => JSON.stringify(C) !== snapshot;
