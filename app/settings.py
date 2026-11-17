@@ -64,6 +64,11 @@ def set_value(conn, key, value):
     )
 
 
+def bump_menu_version(conn):
+    """Tell open apps to reload the menu (dishes or sections changed)."""
+    set_value(conn, "menu_version", str(int(get_value(conn, "menu_version") or 0) + 1))
+
+
 def valid_timezone(name) -> bool:
     if not isinstance(name, str) or not name:
         return False

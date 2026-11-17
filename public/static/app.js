@@ -255,7 +255,7 @@ const ROUTES = [
   [/^\/$/, 'home'], [/^\/login$/, 'login'], [/^\/setup$/, 'setup'],
   [/^\/plan(?:\/(\d{4}-\d{2}-\d{2}))?$/, 'plan'], [/^\/now$/, 'now'], [/^\/orders$/, 'orders'],
   [/^\/kitchen(?:\/(\d{4}-\d{2}-\d{2}))?$/, 'kitchen'],
-  [/^\/admin(?:\/(menu|families|people|settings))?$/, 'admin'], [/^\/me$/, 'me'],
+  [/^\/admin(?:\/(menu|sections|families|people|settings))?$/, 'admin'], [/^\/me$/, 'me'],
 ];
 let lastHash = location.hash;
 let ignoreHash = false;
@@ -366,10 +366,14 @@ async function poll() {
     }
     S.unread = p.unread;
     updateBadge();
-    if (p.version !== S.version) {
-      S.version = p.version;
-      if (S.view && S.view.refresh && !(S.view.isDirty && S.view.isDirty())) S.view.refresh();
+    let changed = p.version !== S.version;
+    S.version = p.version;
+    if (p.menuVersion !== S.menuVersion) {  // dishes or sections were edited: fetch the new menu
+      S.menuVersion = p.menuVersion;
+      await loadMenu();
+      changed = true;
     }
+    if (changed && S.view && S.view.refresh && !(S.view.isDirty && S.view.isDirty())) S.view.refresh();
   } catch (e) { /* offline: try again next tick */ }
 }
 
@@ -558,7 +562,7 @@ function openPicker(target, title, people, onChange) {
     const list = S.menu.dishes.filter((d) => (cat === 'all' || String(d.categoryId) === cat)
       && (!q || d.name.toLowerCase().includes(q) || d.description.toLowerCase().includes(q)));
     const order = new Map(S.menu.categories.map((c, i) => [c.id, i]));
-    list.sort((a, b) => (order.get(a.categoryId) - order.get(b.categoryId)) || a.name.localeCompare(b.name));
+    list.sort((a, b) => (order.get(a.categoryId) - order.get(b.categoryId)) || (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
     $('#pk-grid', sheet.el).innerHTML = list.length ? list.map((d) => `
       <button class="dish-card ${picked.has(d.id) ? 'on' : ''}" data-sact="toggle" data-d="${d.id}" aria-pressed="${picked.has(d.id)}">
         <div class="ph">${dishThumb(d)}</div><span class="tick">${icon(picked.has(d.id) ? 'check' : 'plus')}</span>
@@ -1189,7 +1193,7 @@ async function logout() {
 
 /* ============================== admin ============================== */
 VIEWS.admin = async (seq, tab = 'menu') => {
-  const tabs = [['menu', 'Menu'], ['families', 'Families'], ['people', 'People'], ['settings', 'Settings']];
+  const tabs = [['menu', 'Menu'], ['sections', 'Sections'], ['families', 'Families'], ['people', 'People'], ['settings', 'Settings']];
   const head = `<div class="page-head"><div><div class="eyebrow">Admin</div><h1>${esc(tabs.find((t) => t[0] === tab)[1])}</h1></div></div>
     <div class="chips admin-tabs">${tabs.map(([k, l]) => `<a class="chip ${k === tab ? 'active' : ''}" href="#/admin/${k}">${l}</a>`).join('')}</div>`;
   await ADMIN[tab](seq, head);
@@ -1201,28 +1205,33 @@ ADMIN.menu = async (seq, head) => {
   let data = await api('/menu?all=1');
   let filter = 'all';
   let q = '';
+  const dishRow = (d, n, c) => `<div class="dish-row ${d.active ? '' : 'off'}">
+      <span class="small muted" style="min-width:22px;text-align:right">${n}.</span>
+      <div class="thumb">${d.image ? `<img src="${esc(d.image)}" alt="">` : esc(c ? c.icon : '🍽️')}</div>
+      <div class="grow"><div class="pk-name">${esc(d.name)}</div>${d.description ? `<div class="small muted">${esc(d.description)}</div>` : ''}</div>
+      <label class="switch" title="Available to order"><input type="checkbox" data-ch="avail" data-id="${d.id}" ${d.active ? 'checked' : ''} aria-label="Available"></label>
+      <button class="icon-btn" data-act="edit" data-id="${d.id}" aria-label="Edit ${esc(d.name)}">${icon('edit')}</button></div>`;
   const draw = () => {
-    const order = new Map(data.categories.map((c, i) => [c.id, i]));
-    const list = data.dishes.filter((d) => (filter === 'all' || String(d.categoryId) === filter) && (!q || d.name.toLowerCase().includes(q)))
-      .sort((a, b) => (order.get(a.categoryId) - order.get(b.categoryId)) || a.name.localeCompare(b.name));
     const counts = {};
     data.dishes.forEach((d) => { counts[d.categoryId] = (counts[d.categoryId] || 0) + 1; });
     $('#menu-cats').innerHTML = [`<button class="chip ${filter === 'all' ? 'active' : ''}" data-act="filter" data-c="all">All <span class="n">${data.dishes.length}</span></button>`]
       .concat(data.categories.map((c) => `<button class="chip ${filter === String(c.id) ? 'active' : ''}" data-act="filter" data-c="${c.id}">${esc(c.icon)} ${esc(c.name)} <span class="n">${counts[c.id] || 0}</span></button>`)).join('');
-    $('#menu-list').innerHTML = list.length ? list.map((d) => {
-      const c = data.categories.find((x) => x.id === d.categoryId);
-      return `<div class="dish-row ${d.active ? '' : 'off'}"><div class="thumb">${d.image ? `<img src="${esc(d.image)}" alt="">` : esc(c ? c.icon : '🍽️')}</div>
-        <div class="grow"><div class="pk-name">${esc(d.name)}</div><div class="small muted">${esc(c ? c.name : '')}${d.description ? ' · ' + esc(d.description) : ''}</div></div>
-        <label class="switch" title="Available to order"><input type="checkbox" data-ch="avail" data-id="${d.id}" ${d.active ? 'checked' : ''} aria-label="Available"></label>
-        <button class="icon-btn" data-act="edit" data-id="${d.id}" aria-label="Edit ${esc(d.name)}">${icon('edit')}</button></div>`;
-    }).join('') : '<div class="empty"><div class="em">🍽️</div><p>No dishes here yet.</p></div>';
+    const groups = data.categories.filter((c) => filter === 'all' || String(c.id) === filter).map((c) => {
+      const dishes = data.dishes.filter((d) => d.categoryId === c.id && (!q || d.name.toLowerCase().includes(q)))
+        .sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+      if (!dishes.length && (q || filter === 'all')) return '';
+      return `<div class="card"><div class="card-head" style="margin-bottom:4px"><h2>${esc(c.icon)} ${esc(c.name)}</h2><span class="small muted">${plural(dishes.length, 'dish', 'dishes')}</span></div>
+        ${dishes.length ? dishes.map((d, i) => dishRow(d, i + 1, c)).join('') : '<p class="small muted">No dishes in this section yet.</p>'}</div>`;
+    }).join('');
+    $('#menu-list').innerHTML = groups || `<div class="card empty"><div class="em">🍽️</div><p>${q ? 'No dishes match.' : 'The menu is empty. Use “Bulk add” to paste your whole menu at once.'}</p></div>`;
   };
   if (!paint(seq, `${head}
     <div class="row wrap" style="margin-bottom:12px"><div class="search grow" style="flex-basis:240px">${icon('search')}<input class="input" type="search" data-in="q" placeholder="Search dishes"></div>
-      <button class="btn secondary" data-act="cats">${icon('list')} Categories</button>
+      <a class="btn secondary" href="#/admin/sections">${icon('list')} Sections</a>
+      <button class="btn secondary" data-act="bulk">${icon('plus')} Bulk add</button>
       <button class="btn" data-act="add">${icon('plus')} Add dish</button></div>
     <div class="chips" id="menu-cats"></div>
-    <div class="card" style="margin-top:8px"><div id="menu-list"></div></div>
+    <div class="stack" id="menu-list" style="margin-top:8px"></div>
     <p class="small muted" style="margin-top:10px">Turn a dish off to hide it from the menu without deleting it.</p>`)) return;
   draw();
   const reload = async () => { data = await api('/menu?all=1'); await loadMenu(); draw(); };
@@ -1234,8 +1243,50 @@ ADMIN.menu = async (seq, head) => {
   };
   S.actions.add = () => dishEditor(null, data.categories, filter !== 'all' ? Number(filter) : null, reload);
   S.actions.edit = (el) => dishEditor(data.dishes.find((d) => d.id === Number(el.dataset.id)), data.categories, null, reload);
-  S.actions.cats = () => categoryEditor(data.categories, reload);
+  S.actions.bulk = () => bulkImport(reload);
 };
+
+function bulkImport(onDone) {
+  let preview = null;
+  const sheet = openSheet({
+    title: 'Bulk add dishes',
+    body: `<p class="small muted">Paste your menu. Put each <b>section</b> name on its own line, and its <b>dishes</b> underneath — numbers like “1.” are optional. Dishes keep the order you paste them in.</p>
+      <textarea class="input" id="bulk-text" rows="12" placeholder="Appetizers&#10;1. chicken and mushroom pot pie&#10;2. fried shrimps&#10;&#10;Main Dishes&#10;1. chicken machbous&#10;2. lasagna"></textarea>
+      <label class="switch"><input type="checkbox" id="bulk-replace"> Replace the whole menu — delete all current dishes, and any section not in this list</label>
+      <div id="bulk-preview"></div>`,
+    foot: '<button class="btn secondary" data-sact="close">Cancel</button><button class="btn secondary" data-sact="preview">Preview</button><button class="btn" data-sact="apply" disabled id="bulk-apply">Import</button>',
+    actions: {
+      preview: async (el, _e, s) => {
+        busy(el, true, 'Checking…');
+        try {
+          preview = await api('/admin/menu/import', { method: 'POST', body: { text: $('#bulk-text', s.el).value, replace: $('#bulk-replace', s.el).checked } });
+          const p = preview;
+          $('#bulk-preview', s.el).innerHTML = `<div class="card flat stack" style="gap:8px">
+            <b>${plural(p.added, 'new dish', 'new dishes')} in ${plural(p.sections.length, 'section')}${p.skipped ? ` · ${p.skipped} already on the menu (skipped)` : ''}</b>
+            ${p.removeDishes ? `<div class="banner danger">${icon('alert')}<div>Deletes the current <b>${plural(p.removeDishes, 'dish', 'dishes')}</b>${p.removeSections.length ? ` and the sections <b>${p.removeSections.map(esc).join(', ')}</b>` : ''}. Past orders keep their dish names.</div></div>` : ''}
+            ${p.sections.map((c) => `<div><b>${esc(c.icon)} ${esc(c.name)}</b>${c.isNew ? ' <span class="pill accent">new section</span>' : ''}
+              <ol class="small" style="margin:4px 0 0 18px;padding:0">${c.dishes.map((d) => `<li>${esc(d)}</li>`).join('')}</ol></div>`).join('')}</div>`;
+          $('#bulk-apply', s.el).disabled = !p.added && !p.removeDishes;
+        } catch (e) { fail(e); }
+        busy(el, false);
+      },
+      apply: async (el, _e, s) => {
+        busy(el, true, 'Importing…');
+        try {
+          const p = await api('/admin/menu/import', { method: 'POST', body: { text: $('#bulk-text', s.el).value, replace: $('#bulk-replace', s.el).checked, apply: true } });
+          s.close();
+          toast(`Added ${plural(p.added, 'dish', 'dishes')} ✓`);
+          onDone();
+        } catch (e) { busy(el, false); fail(e); }
+      },
+    },
+  });
+  // any edit after a preview needs a fresh preview
+  const stale = () => { if (preview) { preview = null; $('#bulk-apply', sheet.el).disabled = true; } };
+  $('#bulk-text', sheet.el).addEventListener('input', stale);
+  $('#bulk-replace', sheet.el).addEventListener('change', stale);
+  setTimeout(() => $('#bulk-text', sheet.el).focus(), 60);
+}
 
 function resizeImage(file, max = 1000) {
   return new Promise((resolve, reject) => {
@@ -1265,7 +1316,7 @@ function dishEditor(dish, cats, defaultCat, onSaved) {
         <label class="btn sm secondary">${icon('camera')} Choose photo<input type="file" accept="image/*" id="de-file" hidden></label>
         <button class="btn sm ghost" data-sact="rmimg" id="de-rm">Remove photo</button></div></div>
       <div class="field"><label for="de-name">Name</label><input class="input" id="de-name" maxlength="80" value="${esc(dish ? dish.name : '')}"></div>
-      <div class="field"><label for="de-cat">Category</label><select class="input" id="de-cat">${cats.map((c) => `<option value="${c.id}" ${(dish ? dish.categoryId : defaultCat) === c.id ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select></div>
+      <div class="field"><label for="de-cat">Section</label><select class="input" id="de-cat">${cats.map((c) => `<option value="${c.id}" ${(dish ? dish.categoryId : defaultCat) === c.id ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select></div>
       <div class="field"><label for="de-desc">Description (optional)</label><textarea class="input" id="de-desc" maxlength="300" rows="2">${esc(dish ? dish.description : '')}</textarea></div>
       <label class="switch"><input type="checkbox" id="de-active" ${!dish || dish.active ? 'checked' : ''}> Available to order</label>
       <div class="err" id="de-err"></div>`,
@@ -1308,54 +1359,47 @@ function dishEditor(dish, cats, defaultCat, onSaved) {
   setTimeout(() => { if (!dish) $('#de-name', sheet.el).focus(); }, 60);
 }
 
-function categoryEditor(cats, onChanged) {
-  let list = cats;
-  const sheet = openSheet({
-    title: 'Categories',
-    cls: 'small',
-    body: '',
-    actions: {
-      up: (el) => move(el, 'up'),
-      down: (el) => move(el, 'down'),
-      del: async (el) => {
-        const c = list.find((x) => x.id === Number(el.dataset.id));
-        if (!(await ask({ title: `Delete ${c.name}?`, ok: 'Delete', danger: true }))) return;
-        try { list = (await api(`/categories/${c.id}`, { method: 'DELETE', body: {} })).categories; draw(); onChanged(); } catch (e) { fail(e); }
-      },
-      add: async () => {
-        const name = $('#cat-new', sheet.el).value.trim();
-        const ic = $('#cat-new-icon', sheet.el).value.trim();
-        if (!name) return;
-        try { list = (await api('/categories', { method: 'POST', body: { name, icon: ic } })).categories; draw(); onChanged(); } catch (e) { fail(e); }
-      },
-    },
-  });
-  async function move(el, dir) {
-    try { list = (await api(`/categories/${el.dataset.id}`, { method: 'PUT', body: { move: dir } })).categories; draw(); onChanged(); } catch (e) { fail(e); }
-  }
-  function draw() {
-    sheet.body(`<p class="small muted">Rename a category or change its emoji, then click outside the box to save.</p>
-      <div class="list">${list.map((c, i) => `<div class="list-item">
-        <input class="input" style="width:58px;text-align:center" maxlength="8" value="${esc(c.icon)}" data-cid="${c.id}" data-f="icon" aria-label="Emoji">
-        <input class="input grow" maxlength="40" value="${esc(c.name)}" data-cid="${c.id}" data-f="name" aria-label="Name">
-        <button class="icon-btn" data-sact="up" data-id="${c.id}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">${icon('up')}</button>
-        <button class="icon-btn" data-sact="down" data-id="${c.id}" ${i === list.length - 1 ? 'disabled' : ''} aria-label="Move down">${icon('down')}</button>
-        <button class="icon-btn" data-sact="del" data-id="${c.id}" aria-label="Delete">${icon('trash')}</button></div>`).join('')}</div>
-      <div class="row"><input class="input" id="cat-new-icon" style="width:58px;text-align:center" maxlength="8" placeholder="🍽️" aria-label="Emoji">
-        <input class="input grow" id="cat-new" maxlength="40" placeholder="New category, e.g. Breakfast">
-        <button class="btn" data-sact="add">Add</button></div>`);
-  }
-  sheet.el.addEventListener('change', async (e) => {
-    const inp = e.target.closest('[data-cid]');
-    if (!inp) return;
-    try {
-      list = (await api(`/categories/${inp.dataset.cid}`, { method: 'PUT', body: { [inp.dataset.f]: inp.value } })).categories;
-      toast('Saved');
-      onChanged();
-    } catch (err) { fail(err); draw(); }
-  });
+/* --- sections --- */
+ADMIN.sections = async (seq, head) => {
+  let list = (await api('/menu?all=1')).categories;
+  const draw = () => paint(S.seq, `${head}
+    <p class="muted" style="margin-bottom:12px">Sections are the groups families choose from, like Appetizers or Main Dishes. Families see them in this order. Change a name or emoji, then tap outside the box — it saves by itself.</p>
+    <div class="card"><div class="list">${list.map((c, i) => `<div class="list-item sec-row">
+        <input class="input sec-emoji" maxlength="8" value="${esc(c.icon)}" data-ch="sec" data-cid="${c.id}" data-f="icon" aria-label="Emoji for ${esc(c.name)}">
+        <div class="grow"><input class="input" maxlength="40" value="${esc(c.name)}" data-ch="sec" data-cid="${c.id}" data-f="name" aria-label="Section name">
+          <div class="tiny muted" style="margin-top:3px">${plural(c.dishCount, 'dish', 'dishes')}</div></div>
+        <button class="icon-btn" data-act="up" data-id="${c.id}" ${i === 0 ? 'disabled' : ''} aria-label="Move ${esc(c.name)} up">${icon('up')}</button>
+        <button class="icon-btn" data-act="down" data-id="${c.id}" ${i === list.length - 1 ? 'disabled' : ''} aria-label="Move ${esc(c.name)} down">${icon('down')}</button>
+        <button class="icon-btn" data-act="del" data-id="${c.id}" aria-label="Delete ${esc(c.name)}">${icon('trash')}</button></div>`).join('')
+      || '<p class="muted">No sections yet.</p>'}</div></div>
+    <div class="card" style="margin-top:12px"><h2 style="margin-bottom:10px">Add a section</h2>
+      <div class="row sec-row"><input class="input sec-emoji" id="sec-new-icon" maxlength="8" placeholder="🍽️" aria-label="Emoji">
+        <input class="input grow" id="sec-new" maxlength="40" placeholder="e.g. Soups, Salads, Desserts">
+        <button class="btn" data-act="add">${icon('plus')} Add</button></div></div>`);
+  if (seq !== S.seq) return;
   draw();
-}
+  const changed = async (res, msg) => { list = res.categories; await loadMenu(); draw(); if (msg) toast(msg); };
+  const move = async (el, dir) => {
+    try { await changed(await api(`/categories/${el.dataset.id}`, { method: 'PUT', body: { move: dir } })); } catch (e) { fail(e); }
+  };
+  S.actions.up = (el) => move(el, 'up');
+  S.actions.down = (el) => move(el, 'down');
+  S.actions.del = async (el) => {
+    const c = list.find((x) => x.id === Number(el.dataset.id));
+    if (c.dishCount) { toast(`Move or delete the ${plural(c.dishCount, 'dish', 'dishes')} in ${c.name} first (Admin → Menu).`, { error: true }); return; }
+    if (!(await ask({ title: `Delete the section “${c.name}”?`, ok: 'Delete', danger: true }))) return;
+    try { await changed(await api(`/categories/${c.id}`, { method: 'DELETE', body: {} }), 'Section deleted'); } catch (e) { fail(e); }
+  };
+  S.actions.add = async () => {
+    const name = $('#sec-new').value.trim();
+    if (!name) { $('#sec-new').focus(); return; }
+    try { await changed(await api('/categories', { method: 'POST', body: { name, icon: $('#sec-new-icon').value.trim() } }), `Added “${name}”`); } catch (e) { fail(e); }
+  };
+  S.inputs.sec = async (el) => {
+    try { await changed(await api(`/categories/${el.dataset.cid}`, { method: 'PUT', body: { [el.dataset.f]: el.value } }), 'Saved'); }
+    catch (e) { fail(e); draw(); }
+  };
+};
 
 /* --- families --- */
 ADMIN.families = async (seq, head) => {
@@ -1593,6 +1637,7 @@ async function boot() {
   S.user = S.boot.user;
   if (S.user) {
     S.version = S.boot.version;
+    S.menuVersion = S.boot.menuVersion;
     S.actHouse = S.user.houseId;
     await loadMenu();
     renderShell();

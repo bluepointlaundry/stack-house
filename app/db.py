@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS dishes (
     description TEXT NOT NULL DEFAULT '',
     image       TEXT,
     active      INTEGER NOT NULL DEFAULT 1,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -296,6 +297,7 @@ def init_db(target):
             with conn.transaction():
                 conn.execute("SELECT pg_advisory_xact_lock(7731001)")  # one starter at a time
                 conn.script(schema)
+                _migrate(conn)
                 for t in TABLES:
                     # Only the app's own server login may touch these tables. Supabase's public
                     # API roles get nothing: RLS on, no policies, privileges revoked.
@@ -312,6 +314,7 @@ def init_db(target):
             conn.execute("PRAGMA journal_mode = WAL")
             conn.script(SCHEMA.format(ID="INTEGER PRIMARY KEY", BLOB="BLOB"))
             with conn.transaction():
+                _migrate(conn)
                 _seed(conn)
     finally:
         conn.close()
@@ -349,6 +352,14 @@ def ensure_supabase_timer(target, host):
         conn.close()
 
 
+def _migrate(conn):
+    """Bring databases created by older versions up to date."""
+    if conn.postgres:
+        conn.execute("ALTER TABLE dishes ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0")
+    elif "sort_order" not in [r["name"] for r in conn.execute("PRAGMA table_info(dishes)")]:
+        conn.execute("ALTER TABLE dishes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+
+
 def _seed(conn):
     now = clock.iso_now()
     if conn.execute("SELECT COUNT(*) FROM houses").fetchone()[0] == 0:
@@ -370,8 +381,9 @@ def add_sample_dishes(conn):
         cat_id = cats.get(cat_name.lower())
         if cat_id is None:
             continue
-        for name, desc in dishes:
+        for pos, (name, desc) in enumerate(dishes):
             conn.execute(
-                "INSERT INTO dishes (category_id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (cat_id, name, desc, now, now),
+                "INSERT INTO dishes (category_id, name, description, sort_order, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (cat_id, name, desc, pos, now, now),
             )

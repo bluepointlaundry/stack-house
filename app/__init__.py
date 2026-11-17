@@ -59,6 +59,16 @@ def create_app(test_config=None):
             ok, message = db.ensure_supabase_timer(database, host)
             settings.set_value(conn, "timer_setup", message)
             logging.getLogger("stackhouse").log(logging.INFO if ok else logging.WARNING, message)
+        # The Stack House menu replaces the sample menu once on the live site (see app/menu_data.py).
+        if test_config.get("APPLY_MENU", on_vercel and os.environ.get("VERCEL_ENV") == "production"):
+            from . import menu_data, menu_import
+            applied = menu_import.apply_import(
+                conn, menu_data.MENU, True,
+                lambda path: conn.execute("DELETE FROM images WHERE name = ?", (path.rsplit("/", 1)[-1],)),
+                once_key=menu_data.MENU_KEY)
+            if applied:
+                settings.bump_menu_version(conn)
+                logging.getLogger("stackhouse").info("menu applied: %s dishes", applied["added"])
     finally:
         conn.close()
 

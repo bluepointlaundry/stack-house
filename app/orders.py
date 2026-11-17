@@ -111,7 +111,7 @@ def clean_items(conn, raw_items, allow_inactive=()):
         return []
     ids = list(wanted)
     dishes = {r["id"]: r for r in conn.execute(
-        f"""SELECT d.id, d.name, d.active, c.name AS category, c.sort_order
+        f"""SELECT d.id, d.name, d.active, d.sort_order AS dish_order, c.name AS category, c.sort_order
             FROM dishes d JOIN categories c ON c.id = d.category_id
             WHERE d.id IN ({','.join('?' * len(ids))})""", ids)}
     out = []
@@ -122,7 +122,7 @@ def clean_items(conn, raw_items, allow_inactive=()):
         if not d["active"] and dish_id not in allow_inactive:
             raise ApiError(400, f"{d['name']} is not available right now.")
         out.append({"dish_id": dish_id, "name": d["name"], "category": d["category"],
-                    "sort": (d["sort_order"], d["name"].lower()), **extra})
+                    "sort": (d["sort_order"], d["dish_order"], d["name"].lower()), **extra})
     out.sort(key=lambda i: i["sort"])
     return out
 

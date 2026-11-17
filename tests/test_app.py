@@ -289,6 +289,62 @@ class StackHouseTest(unittest.TestCase):
             self.assertEqual(c.post("/api/login", json={"username": "salem", "password": "wrong"}).status_code, 401)
         self.assertEqual(c.post("/api/login", json={"username": "salem", "password": "secret1"}).status_code, 429)
 
+    def test_bulk_menu_import_replaces_sample_menu(self):
+        from app import menu_data
+        # an order placed from the sample menu must survive the replacement
+        self.plan(self.salem, "2026-11-17", {"lunch": {"need": True, "items": [{"dishId": self.dish("Hummus"), "servings": 3}]}})
+
+        self.assertEqual(self.salem.post("/api/admin/menu/import", json={"text": menu_data.MENU}).status_code, 403)
+        preview = self.admin.post("/api/admin/menu/import", json={"text": menu_data.MENU, "replace": True}).json
+        self.assertEqual([s["name"] for s in preview["sections"]], ["Appetizers", "Main Dishes", "Fatayer", "Sandwiches"])
+        self.assertEqual((preview["added"], preview["removeDishes"]), (35, 18))
+        self.assertEqual(set(preview["removeSections"]), {"Starters", "Soups", "Salads", "Main dish", "Desserts"})
+        self.assertEqual(len(self.admin.get("/api/menu").json["dishes"]), 18)  # preview changes nothing
+
+        r = self.admin.post("/api/admin/menu/import", json={"text": menu_data.MENU, "replace": True, "apply": True})
+        self.assertEqual(r.status_code, 200, r.json)
+        menu = self.salem.get("/api/menu").json
+        self.assertEqual([(c["name"], c["icon"]) for c in menu["categories"]],
+                         [("Appetizers", "🥟"), ("Main Dishes", "🍛"), ("Fatayer", "🫓"), ("Sandwiches", "🥪")])
+
+        def section(name):
+            cid = next(c["id"] for c in menu["categories"] if c["name"] == name)
+            return [d["name"] for d in sorted((d for d in menu["dishes"] if d["categoryId"] == cid),
+                                              key=lambda d: d["sortOrder"])]
+        self.assertEqual(section("Appetizers"), ["Chicken and mushroom pot pie", "Fried shrimps"])
+        main = section("Main Dishes")
+        self.assertEqual(len(main), 20)
+        self.assertEqual((main[0], main[14], main[19]),
+                         ("Chicken machbous", "Grilled chicken with honey mustard sauce and white rice",
+                          "Meat doner shawarma"))
+        self.assertEqual(section("Sandwiches")[1], "Chicken salad sandwich (Greek yogurt base)")
+        old = self.salem.get("/api/plan/2026-11-17").json["meals"]["lunch"]
+        self.assertEqual(old["items"][0]["name"], "Hummus")
+
+        # pasting the same list again (without replace) adds nothing
+        again = self.admin.post("/api/admin/menu/import", json={"text": menu_data.MENU}).json
+        self.assertEqual((again["added"], again["skipped"]), (0, 35))
+
+    def test_menu_text_parsing(self):
+        from app.menu_import import parse_menu
+        got = parse_menu("Wraps:\nfalafel wrap - with tahini\n\nDrinks\n1) Tea\n2) Coffee\n")
+        self.assertEqual(got, [("Wraps", [("Falafel wrap", "with tahini")]),
+                               ("Drinks", [("Tea", ""), ("Coffee", "")])])
+
+    def test_sections_can_be_added_renamed_and_reordered(self):
+        r = self.admin.post("/api/categories", json={"name": "Breakfast ", "icon": "🍳"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([c["name"] for c in r.json["categories"]][-1], "Breakfast")  # new sections go last
+        self.assertEqual(self.admin.post("/api/categories", json={"name": "breakfast"}).json["error"],
+                         "That section already exists.")
+        new = next(c for c in r.json["categories"] if c["name"] == "Breakfast")
+        self.assertEqual(new["dishCount"], 0)
+        r = self.admin.put(f"/api/categories/{new['id']}", json={"name": "Morning breakfast", "move": "up"})
+        names = [c["name"] for c in r.json["categories"]]
+        self.assertEqual(names[-2:], ["Morning breakfast", "Desserts"])
+        soups = next(c for c in r.json["categories"] if c["name"] == "Soups")
+        self.assertEqual(self.admin.delete(f"/api/categories/{soups['id']}", json={}).status_code, 409)  # has dishes
+
     def test_password_change_signs_out_other_sessions(self):
         other = self.login("salem")
         r = self.salem.post("/api/me/password", json={"current": "secret1", "new": "newpass1"})
@@ -338,6 +394,22 @@ class LiveHostingTest(unittest.TestCase):
         from app.db import clean_postgres_url
         cleaned = clean_postgres_url("postgres://u:p@db.example.com:6543/postgres?supa=base-pooler.x&sslmode=require")
         self.assertEqual(cleaned, "postgres://u:p@db.example.com:6543/postgres?sslmode=require")
+
+    def test_live_menu_is_applied_only_once(self):
+        db_cfg = {"DATABASE": self.app.config["DATABASE"], "SCHEDULER": False, "TESTING": True, "APPLY_MENU": True}
+        first = create_app(db_cfg).test_client()
+        first.post("/api/setup", headers={"X-Forwarded-Proto": "https"}, json={
+            "name": "A", "username": "admin", "password": "secret1", "houseId": 1})
+        menu = first.get("/api/menu", headers={"X-Forwarded-Proto": "https"}).json
+        self.assertEqual(len(menu["dishes"]), 35)
+        self.assertEqual(menu["categories"][0]["name"], "Appetizers")
+        dish = menu["dishes"][0]["id"]
+        first.delete(f"/api/dishes/{dish}", json={}, headers={"X-Forwarded-Proto": "https"})
+        # a later start of the live site must not undo the admin's own edits
+        second = create_app(db_cfg).test_client()
+        second.post("/api/login", headers={"X-Forwarded-Proto": "https"},
+                    json={"username": "admin", "password": "secret1"})
+        self.assertEqual(len(second.get("/api/menu", headers={"X-Forwarded-Proto": "https"}).json["dishes"]), 34)
 
     def test_timer_setup_fails_gracefully(self):
         from app.db import ensure_supabase_timer

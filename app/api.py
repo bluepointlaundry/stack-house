@@ -61,13 +61,14 @@ def user_json(u):
 
 
 def categories(conn):
-    return [{"id": r["id"], "name": r["name"], "icon": r["icon"], "sortOrder": r["sort_order"]}
-            for r in conn.execute("SELECT * FROM categories ORDER BY sort_order, id")]
+    return [{"id": r["id"], "name": r["name"], "icon": r["icon"], "sortOrder": r["sort_order"], "dishCount": r["n"]}
+            for r in conn.execute("SELECT c.*, (SELECT COUNT(*) FROM dishes d WHERE d.category_id = c.id) AS n "
+                                  "FROM categories c ORDER BY c.sort_order, c.id")]
 
 
 def dish_json(r):
     return {"id": r["id"], "categoryId": r["category_id"], "name": r["name"], "description": r["description"],
-            "image": r["image"], "active": bool(r["active"])}
+            "image": r["image"], "active": bool(r["active"]), "sortOrder": r["sort_order"]}
 
 
 def target_house(user, requested=None):
@@ -110,6 +111,7 @@ def bootstrap():
             "lockTomorrow": rules.fmt_lock(cfg, rules.today(cfg) + timedelta(days=1)),
             "vapidPublicKey": notify.vapid_public_key(conn),
             "version": orders.get_version(conn),
+            "menuVersion": settings.get_value(conn, "menu_version") or "0",
         })
         if user["is_admin"]:
             data["lastTick"] = settings.get_value(conn, "last_tick")
@@ -195,6 +197,7 @@ def poll():
     latest = conn.execute("SELECT id, title, body, url, kind FROM notifications WHERE user_id = ? "
                           "ORDER BY id DESC LIMIT 1", (current_user()["id"],)).fetchone()
     return jsonify(unread=unread, version=orders.get_version(conn), kitchen=rules.kitchen_status(cfg),
+                   menuVersion=settings.get_value(conn, "menu_version") or "0",
                    today=rules.today(cfg).isoformat(), latest=dict(latest) if latest else None)
 
 
@@ -206,7 +209,7 @@ def menu():
     conn = get_db()
     show_all = request.args.get("all") == "1" and current_user()["is_admin"]
     where = "" if show_all else "WHERE active = 1"
-    dishes = [dish_json(r) for r in conn.execute(f"SELECT * FROM dishes {where} ORDER BY lower(name)")]
+    dishes = [dish_json(r) for r in conn.execute(f"SELECT * FROM dishes {where} ORDER BY sort_order, lower(name)")]
     return jsonify(categories=categories(conn), dishes=dishes)
 
 
@@ -238,12 +241,17 @@ def _delete_image(path):
         get_db().execute("DELETE FROM images WHERE name = ?", (path.rsplit("/", 1)[-1],))
 
 
+def _next_dish_pos(conn, cat_id):
+    return conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM dishes WHERE category_id = ?",
+                        (cat_id,)).fetchone()[0]
+
+
 def _dish_fields(conn, data, existing=None):
     name = text(data.get("name", existing["name"] if existing else ""), 80, "Dish name", required=True)
     desc = text(data.get("description", existing["description"] if existing else ""), 300, "Description")
     cat_id = data.get("categoryId", existing["category_id"] if existing else None)
     if not conn.execute("SELECT 1 FROM categories WHERE id = ?", (cat_id,)).fetchone():
-        raise ApiError(400, "Choose a category.")
+        raise ApiError(400, "Choose a section.")
     active = bool(data.get("active", existing["active"] if existing else True))
     return name, desc, cat_id, active
 
@@ -257,8 +265,10 @@ def create_dish():
     image = _save_image(data["image"]) if data.get("image") else None
     now = clock.iso_now()
     did = conn.execute(
-        "INSERT INTO dishes (category_id, name, description, image, active, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", (cat_id, name, desc, image, int(active), now, now)).fetchone()["id"]
+        "INSERT INTO dishes (category_id, name, description, image, active, sort_order, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        (cat_id, name, desc, image, int(active), _next_dish_pos(conn, cat_id), now, now)).fetchone()["id"]
+    settings.bump_menu_version(conn)
     return jsonify(dish_json(conn.execute("SELECT * FROM dishes WHERE id = ?", (did,)).fetchone()))
 
 
@@ -279,9 +289,11 @@ def update_dish(dish_id):
         elif not data["image"]:
             _delete_image(existing["image"])
             image = None
+    pos = existing["sort_order"] if cat_id == existing["category_id"] else _next_dish_pos(conn, cat_id)
     conn.execute(
-        "UPDATE dishes SET category_id = ?, name = ?, description = ?, image = ?, active = ?, updated_at = ? "
-        "WHERE id = ?", (cat_id, name, desc, image, int(active), clock.iso_now(), dish_id))
+        "UPDATE dishes SET category_id = ?, name = ?, description = ?, image = ?, active = ?, sort_order = ?, "
+        "updated_at = ? WHERE id = ?", (cat_id, name, desc, image, int(active), pos, clock.iso_now(), dish_id))
+    settings.bump_menu_version(conn)
     return jsonify(dish_json(conn.execute("SELECT * FROM dishes WHERE id = ?", (dish_id,)).fetchone()))
 
 
@@ -294,7 +306,25 @@ def delete_dish(dish_id):
         raise ApiError(404, "Dish not found.")
     conn.execute("DELETE FROM dishes WHERE id = ?", (dish_id,))  # past orders keep the dish name
     _delete_image(existing["image"])
+    settings.bump_menu_version(conn)
     return jsonify(ok=True)
+
+
+@bp.post("/admin/menu/import")
+@require_login(admin=True)
+def import_menu():
+    """Bulk-add dishes from pasted text. `apply: false` only previews."""
+    from . import menu_import
+
+    data = body()
+    conn = get_db()
+    replace = bool(data.get("replace"))
+    if not data.get("apply"):
+        _, plan = menu_import.plan_import(conn, data.get("text"), replace)
+        return jsonify(plan)
+    plan = menu_import.apply_import(conn, data.get("text"), replace, _delete_image)
+    settings.bump_menu_version(conn)
+    return jsonify(plan)
 
 
 @bp.post("/categories")
@@ -302,12 +332,13 @@ def delete_dish(dish_id):
 def create_category():
     conn = get_db()
     data = body()
-    name = text(data.get("name"), 40, "Category name", required=True)
+    name = text(data.get("name"), 40, "Section name", required=True)
     icon = text(data.get("icon"), 8, "Icon") or "🍽️"
     if conn.execute("SELECT 1 FROM categories WHERE lower(name) = lower(?)", (name,)).fetchone():
-        raise ApiError(409, "That category already exists.")
+        raise ApiError(409, "That section already exists.")
     order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories").fetchone()[0]
     conn.execute("INSERT INTO categories (name, icon, sort_order) VALUES (?, ?, ?)", (name, icon, order))
+    settings.bump_menu_version(conn)
     return jsonify(categories=categories(conn))
 
 
@@ -317,13 +348,13 @@ def update_category(cat_id):
     conn = get_db()
     row = conn.execute("SELECT * FROM categories WHERE id = ?", (cat_id,)).fetchone()
     if not row:
-        raise ApiError(404, "Category not found.")
+        raise ApiError(404, "Section not found.")
     data = body()
-    name = text(data.get("name", row["name"]), 40, "Category name", required=True)
+    name = text(data.get("name", row["name"]), 40, "Section name", required=True)
     icon = text(data.get("icon", row["icon"]), 8, "Icon") or "🍽️"
     clash = conn.execute("SELECT 1 FROM categories WHERE lower(name) = lower(?) AND id != ?", (name, cat_id)).fetchone()
     if clash:
-        raise ApiError(409, "That category already exists.")
+        raise ApiError(409, "That section already exists.")
     with transaction(conn):
         conn.execute("UPDATE categories SET name = ?, icon = ? WHERE id = ?", (name, icon, cat_id))
         move = data.get("move")
@@ -335,6 +366,7 @@ def update_category(cat_id):
                 ids[i], ids[j] = ids[j], ids[i]
             for pos, cid in enumerate(ids):
                 conn.execute("UPDATE categories SET sort_order = ? WHERE id = ?", (pos, cid))
+    settings.bump_menu_version(conn)
     return jsonify(categories=categories(conn))
 
 
@@ -343,8 +375,9 @@ def update_category(cat_id):
 def delete_category(cat_id):
     conn = get_db()
     if conn.execute("SELECT 1 FROM dishes WHERE category_id = ?", (cat_id,)).fetchone():
-        raise ApiError(409, "Move or delete the dishes in this category first.")
+        raise ApiError(409, "Move or delete the dishes in this section first.")
     conn.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+    settings.bump_menu_version(conn)
     return jsonify(categories=categories(conn))
 
 
