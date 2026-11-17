@@ -16,26 +16,32 @@ Your existing alsalemkuwait.com email (Microsoft 365) and GoDaddy page are not t
 - **Vercel** runs the app (`index.py`) and serves the page files in `public/`.
 - The app keeps everything in **Supabase Postgres**: people, menu, orders, settings and dish photos. It creates its tables on first start, with row-level security on, so Supabase's public API can't read them.
 - **Reminders:** every minute, Supabase's `pg_cron` calls `https://…/api/cron/tick`. The call is protected by a secret stored only in the database. The app then sends any reminders, lock summaries and morning briefs that are due. **Admin → Settings** shows whether this timer is running.
-- **Vercel settings needed:** only `DATABASE_URL` (Supabase → **Connect** → *Transaction pooler*, pasted exactly as shown, including `[YOUR-PASSWORD]`) and `DATABASE_PASSWORD` (the database password).
+- **Vercel settings (Project → Settings → Environment Variables):**
+  - `DATABASE_URL`: the Supabase *Transaction pooler* address, still containing `[YOUR-PASSWORD]`
+  - `DATABASE_PASSWORD`: the database password (type: Secret)
+  - `STACKHOUSE_PUBLIC_HOST` = `stack-house-rust.vercel.app`: the address Supabase calls for reminders. It is kept on the permanent vercel.app address, so reminders don't depend on the GoDaddy record.
 
-## Steps
+## What is live
 
-1. GitHub: create the empty private repository. ✅ done
-2. Upload the code. ✅ done
-3. Supabase: create a free organisation called **Stack House**.
-4. Supabase: create the project in that organisation. ✅ done (Singapore)
-5. Supabase: **Project Settings → Database → Reset database password** → copy the new password. Then click **Connect** (top of the project page) → **Transaction pooler** → copy the URI.
-6. Vercel: **Add New → Project → Import** `stack-house`. Under **Environment Variables** add:
-   - `DATABASE_URL` = the URI from step 5
-   - `DATABASE_PASSWORD` = the password from step 5
+| | |
+|---|---|
+| Family address | https://stackhouse.alsalemkuwait.com |
+| Permanent Vercel address (same site) | https://stack-house-rust.vercel.app |
+| Vercel project | `stack-house` (team mohammedalmutawaq-9247), region `sin1` |
+| Supabase project | `kberxtxjetsyzbanwigf`, organisation Stack House (Free), region ap-southeast-1 |
+| GoDaddy DNS | CNAME `stackhouse` → `fbc005998e262f3f.vercel-dns-016.com` |
 
-   Then click **Deploy**.
-7. Supabase timer: Claude turns on `pg_cron` and `pg_net` and schedules the one-minute call.
-8. Domain:
-   - Vercel → project → **Settings → Domains** → add `stackhouse.alsalemkuwait.com`.
-   - GoDaddy → alsalemkuwait.com → **DNS → Add New Record**: type **CNAME**, name `stackhouse`, value exactly as Vercel shows it.
-   - Don't change any other record.
-9. On your phone (mobile data): open the site, create the admin account, and add the people.
+## Steps (all done)
+
+1. GitHub: create the empty private repository. ✅
+2. Upload the code. ✅
+3. Supabase: create a free organisation called **Stack House**. ✅
+4. Supabase: create the project (Singapore). ✅
+5. Supabase: reset the database password; copy the *Transaction pooler* address. ✅
+6. Vercel: import `stack-house` from GitHub and add the environment variables above. ✅
+7. Reminder timer: the app switches on `pg_net` and `pg_cron` by itself on its first production start. ✅ (Admin → Settings shows it green.)
+8. Domain: added in Vercel; GoDaddy CNAME `stackhouse` added. ✅ Don't change any other GoDaddy record.
+9. Admin account created. ✅ Next: add the people (Admin → People).
 10. Test it — see the checklist below.
 
 ## Testing checklist (live)
